@@ -5,6 +5,7 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/demo-microservice-lab
@@ -34,7 +35,7 @@ jobs:
       - name: Login a Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-      # IMPORTANTE: Dockerfile está en la RAÍZ del repo
+      # Dockerfile en la raíz del repo
       - name: Construir imagen (latest)
         run: docker build -f Dockerfile -t $IMAGE_NAME:latest .
 
@@ -49,28 +50,41 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: (Sanidad) Verificar que el SSH_PRIVATE_KEY esté presente
+      - name: Verificar secrets requeridos
+        env:
+          SSH_PRIVATE_KEY_B64: ${{ secrets.SSH_PRIVATE_KEY_B64 }}
+          EC2_HOST:           ${{ secrets.EC2_HOST }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
-            echo "ERROR: SSH_PRIVATE_KEY está vacío o no existe"; exit 1;
-          else
-            echo "OK: SSH_PRIVATE_KEY presente";
-          fi
+          if [ -z "${SSH_PRIVATE_KEY_B64}" ]; then echo "ERROR: Falta SSH_PRIVATE_KEY_B64"; exit 1; fi
+          if [ -z "${EC2_HOST}" ];           then echo "ERROR: Falta EC2_HOST";           exit 1; fi
+          if [ -z "${DOCKERHUB_USERNAME}" ]; then echo "ERROR: Falta DOCKERHUB_USERNAME"; exit 1; fi
+          echo "OK: Secrets presentes"
 
-      - name: Iniciar ssh-agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Preparar clave SSH (desde Base64) y agente
+        env:
+          SSH_PRIVATE_KEY_B64: ${{ secrets.SSH_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${SSH_PRIVATE_KEY_B64}" | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
 
       - name: Registrar known_hosts
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -T 10 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -T 10 -H "${EC2_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Probar conexión SSH (publickey)
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           ssh -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes \
-              ec2-user@"${{ secrets.EC2_HOST }}" 'whoami && uname -a'
+              ec2-user@"${EC2_HOST}" 'whoami && uname -a'
 
       - name: Desplegar contenedor en EC2
         env:
@@ -90,9 +104,7 @@ jobs:
           fi
 
           docker network inspect appnet >/dev/null 2>&1 || docker network create appnet
-          docker ps -q --filter "name=demo-microservice-lab" | grep -q . && docker stop demo-microservice-lab || true
-          docker ps -aq --filter "name=demo-microservice-lab" | grep -q . && docker rm demo-microservice-lab || true
-
+          docker rm -f demo-microservice-lab 2>/dev/null || true
           docker pull "$IMAGE"
           docker run -d --name demo-microservice-lab --restart unless-stopped \
             --network appnet -p 80:"$APP_PORT" "$IMAGE"
